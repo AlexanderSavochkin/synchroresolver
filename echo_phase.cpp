@@ -8,6 +8,7 @@ Writing wav file is taken from here: https://github.com/Thrifleganger/audio-prog
 #include <fstream>
 #include <algorithm>
 #include <cmath>
+#include <atomic>
 #include <portaudio.h>
 #include "pa_ringbuffer.h"
 
@@ -68,30 +69,30 @@ struct FeedBackData
 {
     float T;
 
-    float CosineSum0;
-    float SineSum0;
-
-    float CosineSum1;
-    float SineSum1;
+    // Seqlock protecting the four correlation outputs.
+    // Even value = stable; odd value = write in progress.
+    // Writer: increment to odd, store data (relaxed), increment to even.
+    // Reader: load (acquire), read data (relaxed), fence (acquire), load again (relaxed);
+    //         retry if values differ or first value was odd.
+    std::atomic<unsigned> seqlock{0};
+    std::atomic<float> CosineSum0{0.f};
+    std::atomic<float> SineSum0{0.f};
+    std::atomic<float> CosineSum1{0.f};
+    std::atomic<float> SineSum1{0.f};
 
     float Frequency;
 
-    int running;
+    std::atomic<int> running{0};
     int numPeriodsToCalculateAngle;
 
     vector<float> inputRingBufferData;
     PaUtilRingBuffer inputRingBuffer;
 
-    FeedBackData() : 
+    FeedBackData() :
         T(0.0f),
-        CosineSum0(0.0f),
-        SineSum0(0.0f),
-        CosineSum1(0.0f),
-        SineSum1(0.0f),
         Frequency(DEFAULT_FREQUENCY_HZ),
         inputRingBufferData(RING_BUFFER_SIZE),
-	numPeriodsToCalculateAngle(20),
-        running(0)
+	numPeriodsToCalculateAngle(20)
 	{        
         long initRingBufferResult = PaUtil_InitializeRingBuffer(
             &inputRingBuffer,
@@ -152,10 +153,20 @@ int processAudioDataCallback(
 	numFramesAccumulated++;
 	if (numFramesAccumulated == feedBackData->numPeriodsToCalculateAngle * SAMPLES_PER_PERIOD)
 	{
-            feedBackData->CosineSum0 = dCosineSum0;
-            feedBackData->SineSum0 = dSineSum0;
-            feedBackData->CosineSum1 = dCosineSum1;
-            feedBackData->SineSum1 = dSineSum1;
+            // Seqlock write protocol: bump to odd (in-progress), store data
+            // with relaxed ordering (the release fences provide the ordering),
+            // then bump to even (done).
+            unsigned seq = feedBackData->seqlock.load(std::memory_order_relaxed);
+            feedBackData->seqlock.store(seq + 1, std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_release); // data stores ordered after odd store
+
+            feedBackData->CosineSum0.store(dCosineSum0, std::memory_order_relaxed);
+            feedBackData->SineSum0.store(dSineSum0,     std::memory_order_relaxed);
+            feedBackData->CosineSum1.store(dCosineSum1, std::memory_order_relaxed);
+            feedBackData->SineSum1.store(dSineSum1,     std::memory_order_relaxed);
+
+            std::atomic_thread_fence(std::memory_order_release); // even store ordered after data stores
+            feedBackData->seqlock.store(seq + 2, std::memory_order_relaxed);
 
 	    numFramesAccumulated = 0;
 
@@ -174,7 +185,7 @@ int processAudioDataCallback(
     }
 
 
-    feedBackData->running++;
+    feedBackData->running.fetch_add(1, std::memory_order_relaxed);
 
     return paContinue;
 }
@@ -259,12 +270,29 @@ void sleep(int milliseconds)
 
 void printFeedbackData(const FeedBackData& feedBackData)
 {
-    auto dotprod = feedBackData.CosineSum0 * feedBackData.CosineSum1 + feedBackData.SineSum0 * feedBackData.SineSum1;
-    auto amplitude0 = sqrt(feedBackData.CosineSum0 * feedBackData.CosineSum0 + feedBackData.SineSum0 * feedBackData.SineSum0);
-    auto amplitude1 = sqrt(feedBackData.CosineSum1 * feedBackData.CosineSum1 + feedBackData.SineSum1 * feedBackData.SineSum1);
-    //auto angle = dotprod / (amplitude0 * amplitude1);
-    auto angle = atan2(feedBackData.SineSum0, feedBackData.CosineSum0) - atan2(feedBackData.SineSum1, feedBackData.CosineSum1);
-    clog << "alpha = " << angle << " Cos0 = " << feedBackData.CosineSum0 << " Sin0 = " << feedBackData.SineSum0 << " Cos1 = " << feedBackData.CosineSum1 << " Sin1 = " << feedBackData.SineSum1 << " Amplitute0 = " << amplitude0 << " Amplitude1 = " << amplitude1 << ' ' << feedBackData.running << "                                          ";
+    // Seqlock read protocol: acquire the counter, load data with relaxed
+    // ordering, issue an acquire fence to prevent the data loads from being
+    // reordered past the second counter read, then verify the counter is
+    // unchanged and even (no write was in progress).
+    float c0, s0, c1, s1;
+    unsigned seq1, seq2;
+    do {
+        seq1 = feedBackData.seqlock.load(std::memory_order_acquire);
+        if (seq1 & 1u) continue; // write in progress — spin
+
+        c0 = feedBackData.CosineSum0.load(std::memory_order_relaxed);
+        s0 = feedBackData.SineSum0.load(std::memory_order_relaxed);
+        c1 = feedBackData.CosineSum1.load(std::memory_order_relaxed);
+        s1 = feedBackData.SineSum1.load(std::memory_order_relaxed);
+
+        std::atomic_thread_fence(std::memory_order_acquire); // data loads committed before counter re-read
+        seq2 = feedBackData.seqlock.load(std::memory_order_relaxed);
+    } while (seq1 != seq2);
+
+    auto amplitude0 = sqrt(c0 * c0 + s0 * s0);
+    auto amplitude1 = sqrt(c1 * c1 + s1 * s1);
+    auto angle = atan2(s0, c0) - atan2(s1, c1);
+    clog << "alpha = " << angle << " Cos0 = " << c0 << " Sin0 = " << s0 << " Cos1 = " << c1 << " Sin1 = " << s1 << " Amplitute0 = " << amplitude0 << " Amplitude1 = " << amplitude1 << ' ' << feedBackData.running.load(std::memory_order_relaxed) << "                                          ";
 }
 
 void printUsage()
